@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/hashicorp/vault/api"
+	upAuth "github.com/hashicorp/vault/api/auth/userpass"
 	"github.com/hashicorp/vault/audit"
 	"github.com/hashicorp/vault/builtin/credential/userpass"
 	"github.com/hashicorp/vault/builtin/logical/totp"
@@ -129,7 +130,6 @@ func TestLoginMfaGenerateTOTPTestAuditIncluded(t *testing.T) {
 	// configure TOTP secret engine
 	var totpPasscode string
 	var methodID string
-	var userpassToken string
 	// login MFA
 	{
 		// create a config
@@ -187,21 +187,17 @@ func TestLoginMfaGenerateTOTPTestAuditIncluded(t *testing.T) {
 			t.Fatalf("failed to configure MFAEnforcementConfig: %v", err)
 		}
 
-		// MFA single-phase login
-		userClient.AddHeader("X-Vault-MFA", fmt.Sprintf("%s:%s", methodID, totpPasscode))
-		secret, err = userClient.Logical().WriteWithContext(context.Background(), "auth/userpass/login/testuser", map[string]interface{}{
-			"password": "testpassword",
-		})
+		upMethod, err := upAuth.NewUserpassAuth("testuser", &upAuth.Password{FromString: "testpassword"})
 		if err != nil {
-			t.Fatalf("MFA failed: %v", err)
+			t.Fatalf("failed to create userpass auth method: %v", err)
 		}
 
-		userpassToken = secret.Auth.ClientToken
-
-		userClient.SetToken(client.Token())
-		secret, err = userClient.Logical().WriteWithContext(context.Background(), "auth/token/lookup", map[string]interface{}{
-			"token": userpassToken,
-		})
+		// MFA single-phase login
+		secret, err = userClient.Auth().MFALogin(context.Background(), upMethod, fmt.Sprintf("%s:%s", methodID, totpPasscode))
+		if err != nil {
+			t.Fatalf("failed to login with userpass auth method: %v", err)
+		}
+		secret, err = userClient.Auth().Token().LookupSelf()
 		if err != nil {
 			t.Fatalf("failed to lookup userpass authenticated token: %v", err)
 		}
@@ -219,9 +215,7 @@ func TestLoginMfaGenerateTOTPTestAuditIncluded(t *testing.T) {
 		headers := user2Client.Headers()
 		headers.Del("X-Vault-MFA")
 		user2Client.SetHeaders(headers)
-		secret, err = user2Client.Logical().WriteWithContext(context.Background(), "auth/userpass/login/testuser", map[string]interface{}{
-			"password": "testpassword",
-		})
+		secret, err = user2Client.Auth().MFALogin(context.Background(), upMethod)
 		if err != nil {
 			t.Fatalf("MFA failed: %v", err)
 		}
@@ -262,12 +256,11 @@ func TestLoginMfaGenerateTOTPTestAuditIncluded(t *testing.T) {
 		}
 		totpPasscode = totpResp.Data["code"].(string)
 
-		secret, err = user2Client.Logical().WriteWithContext(context.Background(), "sys/mfa/validate", map[string]interface{}{
-			"mfa_request_id": secret.Auth.MFARequirement.MFARequestID,
-			"mfa_payload": map[string][]string{
-				methodID: {totpPasscode},
-			},
-		})
+		secret, err = user2Client.Auth().MFAValidate(context.Background(),
+			secret,
+			map[string]interface{}{
+				methodID: []string{totpPasscode},
+			})
 		if err != nil {
 			t.Fatalf("MFA failed: %v", err)
 		}
@@ -302,12 +295,11 @@ func TestLoginMfaGenerateTOTPTestAuditIncluded(t *testing.T) {
 			t.Fatalf("two phase login returned nil MFARequirement")
 		}
 
-		_, err = user2Client.Logical().WriteWithContext(context.Background(), "sys/mfa/validate", map[string]interface{}{
-			"mfa_request_id": secret.Auth.MFARequirement.MFARequestID,
-			"mfa_payload": map[string][]string{
-				methodID: {totpPasscode},
-			},
-		})
+		_, err = user2Client.Sys().MFAValidateWithContext(context.Background(),
+			secret.Auth.MFARequirement.MFARequestID,
+			map[string]interface{}{
+				methodID: []string{totpPasscode},
+			})
 		if err == nil {
 			t.Fatalf("MFA succeeded with an already used passcode")
 		}
@@ -316,7 +308,7 @@ func TestLoginMfaGenerateTOTPTestAuditIncluded(t *testing.T) {
 		}
 
 		// Destroy the secret so that the token can self generate
-		_, err = userClient.Logical().WriteWithContext(context.Background(), fmt.Sprintf("identity/mfa/method/totp/admin-destroy"), map[string]interface{}{
+		_, err = client.Logical().WriteWithContext(context.Background(), fmt.Sprintf("identity/mfa/method/totp/admin-destroy"), map[string]interface{}{
 			"entity_id": entityID,
 			"method_id": methodID,
 		})
